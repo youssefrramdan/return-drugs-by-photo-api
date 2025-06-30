@@ -14,6 +14,9 @@ from datetime import datetime
 import shutil
 from keys import GOOGLE_API_KEY
 import tempfile
+import requests
+from PIL import Image
+from io import BytesIO
 
 app = Flask(__name__)
 os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
@@ -25,7 +28,21 @@ parser = None
 class MedicineName(BaseModel):
     name: str
 
-# Image loader
+# Image loader for URLs
+def load_images_from_urls(inputs: dict) -> dict:
+    image_urls = inputs["image_urls"]
+    def encode_image_from_url(image_url):
+        try:
+            response = requests.get(image_url, timeout=30)
+            response.raise_for_status()
+            return base64.b64encode(response.content).decode('utf-8')
+        except Exception as e:
+            raise Exception(f"Failed to download image from URL: {str(e)}")
+
+    images_base64 = [encode_image_from_url(url) for url in image_urls]
+    return {"images": images_base64}
+
+# Image loader for local files (keeping for compatibility)
 def load_images(inputs: dict) -> dict:
     image_paths = inputs["image_paths"]
     def encode_image(image_path):
@@ -38,6 +55,12 @@ load_images_chain = TransformChain(
     input_variables=["image_paths"],
     output_variables=["images"],
     transform=load_images
+)
+
+load_images_from_urls_chain = TransformChain(
+    input_variables=["image_urls"],
+    output_variables=["images"],
+    transform=load_images_from_urls
 )
 
 @chain
@@ -58,6 +81,18 @@ def image_model(inputs: dict) -> str | list[str] | dict:
         })
     msg = model.invoke([HumanMessage(content=content)])
     return msg.content
+
+def get_medicine_name_from_url(image_url: str) -> dict:
+    global parser
+    parser = JsonOutputParser(pydantic_object=MedicineName)
+
+    prompt = """
+    You are given an image of a medicine box. Your task is to extract the exact name of the medicine as it appears on the package.
+    Do not infer or add anything. Only return the medicine name, and leave empty if not clear.
+    """
+
+    chain = load_images_from_urls_chain | image_model | parser
+    return chain.invoke({'image_urls': [image_url], 'prompt': prompt})
 
 def get_medicine_name(image_paths: List[str]) -> dict:
     global parser
@@ -86,15 +121,18 @@ def info():
         "version": "1.0.0",
         "description": "API for extracting medicine names from images using AI",
         "endpoints": {
-            "/info": "Get API information",
-            "/analyze": "Analyze medicine image (POST with image file)"
+            "/": "Get API information",
+            "/analyze": "Analyze medicine image (POST with image URL)"
         },
         "usage": {
             "/analyze": {
                 "method": "POST",
-                "content_type": "multipart/form-data",
+                "content_type": "application/json",
                 "parameters": {
-                    "image": "Image file (png, jpg, jpeg)"
+                    "image_url": "URL of the image (png, jpg, jpeg)"
+                },
+                "example": {
+                    "image_url": "https://example.com/medicine.jpg"
                 },
                 "response": {
                     "success": "boolean",
@@ -107,50 +145,61 @@ def info():
 
 @app.route('/analyze', methods=['POST'])
 def analyze_medicine():
-    """Main endpoint for analyzing medicine images"""
+    """Main endpoint for analyzing medicine images from URL"""
     try:
-        # Check if image file is provided
-        if 'image' not in request.files:
+        # Get JSON data from request
+        data = request.get_json()
+
+        if not data:
             return jsonify({
                 "success": False,
-                "message": "No image file provided",
+                "message": "No JSON data provided",
                 "medicine_name": None
             }), 400
 
-        uploaded_file = request.files['image']
-
-        if uploaded_file.filename == '':
+        # Check if image URL is provided
+        if 'image_url' not in data:
             return jsonify({
                 "success": False,
-                "message": "No file selected",
+                "message": "No image_url provided in JSON data",
                 "medicine_name": None
             }), 400
 
-        # Check file type
-        allowed_extensions = {'.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG'}
-        file_ext = os.path.splitext(uploaded_file.filename)[1]
-        if file_ext not in allowed_extensions:
+        image_url = data['image_url']
+
+        if not image_url or not isinstance(image_url, str):
             return jsonify({
                 "success": False,
-                "message": "Invalid file type. Please upload PNG, JPG, or JPEG images only",
+                "message": "Invalid image_url provided",
                 "medicine_name": None
             }), 400
 
-        # Create temporary directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = uploaded_file.filename.split('.')[0].replace(' ', '_')
-        output_folder = os.path.join(tempfile.gettempdir(), f"Check_{filename}_{timestamp}")
-        os.makedirs(output_folder, exist_ok=True)
+        # Validate URL format
+        if not (image_url.startswith('http://') or image_url.startswith('https://')):
+            return jsonify({
+                "success": False,
+                "message": "Image URL must start with http:// or https://",
+                "medicine_name": None
+            }), 400
 
-        # Save uploaded file
-        file_path = os.path.join(output_folder, uploaded_file.filename)
-        uploaded_file.save(file_path)
+        # Check if URL points to an image
+        allowed_extensions = ('.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG')
+        if not any(image_url.lower().endswith(ext) for ext in allowed_extensions):
+            # Try to validate by checking content-type
+            try:
+                head_response = requests.head(image_url, timeout=10)
+                content_type = head_response.headers.get('content-type', '').lower()
+                if not content_type.startswith('image/'):
+                    return jsonify({
+                        "success": False,
+                        "message": "URL does not point to a valid image file",
+                        "medicine_name": None
+                    }), 400
+            except:
+                pass  # If head request fails, we'll try anyway
 
         # Analyze the image
-        result = get_medicine_name([file_path])
-
-        # Clean up temporary folder
-        remove_temp_folder(output_folder)
+        result = get_medicine_name_from_url(image_url)
 
         # Return result
         medicine_name = result.get("name", "")
@@ -168,6 +217,12 @@ def analyze_medicine():
                 "medicine_name": None
             })
 
+    except requests.exceptions.RequestException as e:
+        return jsonify({
+            "success": False,
+            "message": f"Error downloading image: {str(e)}",
+            "medicine_name": None
+        }), 400
     except Exception as e:
         return jsonify({
             "success": False,
@@ -175,12 +230,12 @@ def analyze_medicine():
             "medicine_name": None
         }), 500
 
-@app.route('/', methods=['GET'])
+@app.route('/info', methods=['GET'])
 def home():
-    """Default route - redirect to info"""
+    """Alternative info endpoint"""
     return jsonify({
         "message": "Welcome to Medical Prescription Parser API",
-        "info": "Visit /info for API documentation"
+        "info": "Visit / for API documentation"
     })
 
 if __name__ == '__main__':

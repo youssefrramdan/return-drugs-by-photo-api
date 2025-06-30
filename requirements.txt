@@ -3,6 +3,7 @@ Flask
 gunicorn
 pydantic
 python-dotenv
+requests
 
 # Google AI Integration
 langchain
