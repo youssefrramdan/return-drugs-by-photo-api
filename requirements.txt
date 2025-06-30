@@ -1,0 +1,13 @@
+# Core Libraries
+Flask
+gunicorn
+pydantic
+python-dotenv
+
+# Google AI Integration
+langchain
+langchain-core
+langchain-google-genai
+
+# Image Processing
+Pillow
